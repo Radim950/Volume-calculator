@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Pressure Vessel Volume Calculator</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body,#root{height:100%;}
+body{background:#eceff1;font-family:"Segoe UI",Tahoma,Arial,sans-serif;font-size:13px;color:#1a2332;}
+input[type=range]{accent-color:#1565c0;width:100%;height:4px;cursor:pointer;}
+::-webkit-scrollbar{width:7px;}::-webkit-scrollbar-track{background:#dde6f0;}::-webkit-scrollbar-thumb{background:#90a4ae;border-radius:4px;}
+select,input,button{font-family:"Segoe UI",Tahoma,Arial,sans-serif;}
+table{border-collapse:collapse;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useRef,useEffect,useCallback}=React;
+const PI=Math.PI;
+
+/* ═══════════════════════════════════════════════════════════
+   HEAD TYPES  (added Flat End)
+═══════════════════════════════════════════════════════════ */
+const HEAD_TYPES=["2:1 Ellipsoidal","Hemispherical","Korbbogen","Flat End"];
+
+function headH(type,r){
+  if(type==="Hemispherical")   return r;
+  if(type==="2:1 Ellipsoidal") return r/2;
+  if(type==="Flat End")        return 0;   // zero axial extent
+  // Korbbogen DIN 28013
+  const D=2*r,Rc=0.8*D,rk=0.154*D;
+  return Rc-Math.sqrt(Math.max(0,Rc*Rc-(D/2-rk)*(D/2-rk)))+rk;
+}
+function headVol(type,r){
+  if(type==="Hemispherical")   return (2/3)*PI*r*r*r;
+  if(type==="2:1 Ellipsoidal") return (PI/3)*r*r*r;
+  if(type==="Flat End")        return 0;
+  return 0.1309*Math.pow(2*r,3);
+}
+function headNote(type,r){
+  if(type==="2:1 Ellipsoidal") return `h = r/2 (ASME UG-32)`;
+  if(type==="Hemispherical")   return `h = r`;
+  if(type==="Korbbogen")       return `DIN 28013`;
+  if(type==="Flat End")        return `Flat plate (V=0)`;
+  return "";
+}
+
+/* ═══════════════════════════════════════════════════════════
+   VOLUME HELPERS
+═══════════════════════════════════════════════════════════ */
+const cylVol=(r,L)=>PI*r*r*L;
+const coneVol=(r1,r2,L)=>(PI*L/3)*(r1*r1+r1*r2+r2*r2);
+
+// Partial vertical fills
+function pvHead(type,r,h){
+  if(type==="Flat End"||h<=0) return 0;
+  const hT=headH(type,r); if(hT===0) return 0;
+  const hh=Math.min(h,hT);
+  if(type==="Hemispherical")   return PI*hh*hh*(r-hh/3);
+  if(type==="2:1 Ellipsoidal"){const b=r/2;return PI*(r*r/(b*b))*(b*hh*hh-hh*hh*hh/3);}
+  // Korbbogen – smooth cubic interpolation
+  const t=hh/hT; return headVol(type,r)*(3*t*t-2*t*t*t);
+}
+function pvCyl(r,L,h){return PI*r*r*Math.min(Math.max(h,0),L);}
+function pvCone(r1,r2,L,h){
+  if(h<=0)return 0;if(h>=L)return coneVol(r1,r2,L);
+  const dr=r2-r1;return PI*(r1*r1*h+r1*dr*h*h/L+dr*dr*h*h*h/(3*L*L));
+}
+
+// Partial horizontal fills
+function phCyl(r,L,h){
+  if(h<=0)return 0;if(h>=2*r)return PI*r*r*L;
+  const hh=Math.min(Math.max(h,0),2*r),th=Math.acos((r-hh)/r);
+  return L*r*r*(th-Math.sin(th)*Math.cos(th));
+}
+function phHeadNum(r,hT,h){
+  if(hT<=0||h<=0)return 0;
+  const N=600,dx=hT/N;let v=0;
+  for(let i=0;i<N;i++){const x=(i+0.5)*dx,rs=r*Math.sqrt(Math.max(0,1-(x/hT)*(x/hT)));v+=phCyl(rs,dx,h);}
+  return v;
+}
+function phHead(type,r,h){
+  if(type==="Flat End"||h<=0)return 0;
+  if(type==="Hemispherical"){
+    const N=600,dx=r/N;let v=0;
+    for(let i=0;i<N;i++){const x=(i+0.5)*dx,rs=Math.sqrt(Math.max(0,r*r-x*x));v+=phCyl(rs,dx,h);}
+    return v;
+  }
+  return phHeadNum(r,headH(type,r),h);
+}
+function phCone(r1,r2,L,h){
+  if(h<=0)return 0;if(h>=2*Math.max(r1,r2))return coneVol(r1,r2,L);
+  const N=300,dx=L/N;let v=0;
+  for(let i=0;i<N;i++){const x=(i+0.5)*dx,ri=r1+(r2-r1)*x/L;v+=phCyl(ri,dx,h);}
+  return v;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   GEOMETRY  – build element array
+   Each element: {s, a0 (axial start), aL (axial length), r1, r2, fv}
+═══════════════════════════════════════════════════════════ */
+function buildGeo(segs){
+  const els=[];let pos=0;
+  for(const s of segs){
+    if(s.type==="head"){
+      const r=(s.id||0)/2,h=headH(s.headType,r),fv=headVol(s.headType,r);
+      els.push({s,a0:pos,aL:h,r1:r,r2:r,fv});pos+=h;
+    }else if(s.type==="cylinder"){
+      const r=(s.id||0)/2,fv=cylVol(r,s.length||0);
+      els.push({s,a0:pos,aL:s.length||0,r1:r,r2:r,fv});pos+=s.length||0;
+    }else if(s.type==="cone"){
+      const r1=(s.id1||0)/2,r2=(s.id2||0)/2,fv=coneVol(r1,r2,s.length||0);
+      els.push({s,a0:pos,aL:s.length||0,r1,r2,fv});pos+=s.length||0;
+    }
+  }
+  return{els,total:pos};
+}
+
+/* ═══════════════════════════════════════════════════════════
+   FILL CALCULATION
+   Vertical: fillLevel = mm above TL (bottom head/shell junction)
+   Horizontal: fillLevel = mm from bottom of vessel (0..2R)
+═══════════════════════════════════════════════════════════ */
+function calcFill(ori,els,fillLevel){
+  if(!els.length)return 0;
+  const bhH=els[0].s.type==="head"?els[0].aL:0; // bottom head axial height
+  let vol=0;
+  if(ori==="vertical"){
+    const axFill=fillLevel+bhH; // absolute axial position of fill surface
+    for(const e of els){
+      const hi=axFill-e.a0;if(hi<=0)continue;
+      const h=Math.min(hi,e.aL);
+      if(e.s.type==="head")     vol+=pvHead(e.s.headType,e.r1,h);
+      else if(e.s.type==="cylinder")vol+=pvCyl(e.r1,e.aL,h);
+      else                      vol+=pvCone(e.r1,e.r2,e.aL,h);
+    }
+  }else{
+    // fillLevel = mm from centreline (+above, −below); convert to mm from bottom = fillLevel + maxR
+    const h=Math.min(Math.max(fillLevel+Math.max(...els.map(e=>Math.max(e.r1,e.r2))),0),2*Math.max(...els.map(e=>Math.max(e.r1,e.r2))));
+    for(const e of els){
+      if(e.s.type==="head")     vol+=phHead(e.s.headType,e.r1,h);
+      else if(e.s.type==="cylinder")vol+=phCyl(e.r1,e.aL,h);
+      else                      vol+=phCone(e.r1,e.r2,e.aL,h);
+    }
+  }
+  return Math.max(0,vol);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   DRAWING
+   
+   COORDINATE SYSTEM (vertical):
+   - axial 0 = very bottom of vessel (dome tip of bottom head, or bottom of first element)
+   - axial increases UPWARD
+   - canvas y = yBase - axial * scaleY   where yBase = near bottom of canvas
+   
+   BOTTOM HEAD (index 0, dome points DOWN):
+   - flat face is at axial = aL  (top of head element)
+   - dome tip is at axial = 0    (very bottom)
+   - ellipse centre = flat face pixel = py(aL)
+   - arc: from angle 0 to PI (lower semicircle → dome goes DOWN from centre)
+   
+   TOP HEAD (last head, dome points UP):
+   - flat face is at axial = a0  (bottom of head element)
+   - dome tip is at axial = a0+aL (top of vessel)
+   - ellipse centre = flat face pixel = py(a0)
+   - arc: from angle PI to 2*PI  (upper semicircle → dome goes UP from centre)
+   
+   MIDDLE HEAD (between two non-head elements):
+   - treated same as top head — flat face DOWN, dome UP
+     unless it is index 0 (handled as bottom head)
+═══════════════════════════════════════════════════════════ */
+function drawVessel(canvas,ori,els,total,fillLevel){
+  if(!canvas)return;
+  const ctx=canvas.getContext("2d");
+  const W=canvas.width,H=canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  // background + grid
+  ctx.fillStyle="#f5f8fb";ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle="#e0e6ed";ctx.lineWidth=0.5;
+  for(let x=0;x<=W;x+=20){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for(let y=0;y<=H;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+
+  if(!els.length){
+    ctx.fillStyle="#90a4ae";ctx.font="14px Segoe UI,Arial";ctx.textAlign="center";
+    ctx.fillText("Add vessel sections to see drawing",W/2,H/2);ctx.textAlign="left";
+    return;
+  }
+
+  const maxR=Math.max(...els.map(e=>Math.max(e.r1,e.r2)));
+  const PAD_X=56,PAD_TOP=24,PAD_BOT=36;
+
+  if(ori==="vertical"){
+    /* ══ VERTICAL ══════════════════════════════════════════ */
+    const drawH=H-PAD_TOP-PAD_BOT;
+    const drawW=(W-2*PAD_X)/2;
+    const scale=Math.min(drawH/total, drawW/maxR);
+    const cx=W/2;
+    const vesselPxH=total*scale;
+    const yBase=PAD_TOP+(drawH-vesselPxH)/2+vesselPxH;
+    const py=a=>yBase-a*scale;
+    const vEdgeR=cx+maxR*scale; // right edge of vessel (for annotations)
+    const vEdgeL=cx-maxR*scale; // left edge
+
+    const bhH=els[0].s.type==="head"?els[0].aL:0;
+    const axFill=fillLevel+bhH;
+
+    // ── 1. FILL (clipped per element) ────────────────────────
+    for(let i=0;i<els.length;i++){
+      const e=els[i];
+      const fillTop=Math.min(axFill,e.a0+e.aL);
+      if(fillTop<=e.a0)continue;
+      ctx.save();ctx.beginPath();
+      _vertPath(ctx,e,i,scale,cx,py);
+      ctx.clip();
+      ctx.fillStyle="rgba(21,101,192,0.20)";
+      const yFill=py(fillTop),yBot=py(e.a0);
+      ctx.fillRect(vEdgeL-2,yFill,2*(maxR*scale+2),yBot-yFill+1);
+      ctx.restore();
+    }
+
+    // ── 2. VESSEL OUTLINES (main walls) ──────────────────────
+    ctx.strokeStyle="#1a4f7a";ctx.lineWidth=2;ctx.lineJoin="round";
+    for(let i=0;i<els.length;i++){
+      const e=els[i];
+      ctx.beginPath();
+      if(e.s.type==="head"){
+        const rPx=e.r1*scale,hPx=e.aL*scale;
+        if(i===0){
+          if(e.s.headType==="Flat End"){ctx.moveTo(cx-rPx,py(0));ctx.lineTo(cx+rPx,py(0));}
+          else ctx.ellipse(cx,py(e.aL),rPx,hPx,0,0,PI);
+        }else{
+          if(e.s.headType==="Flat End"){ctx.moveTo(cx-rPx,py(e.a0+e.aL));ctx.lineTo(cx+rPx,py(e.a0+e.aL));}
+          else ctx.ellipse(cx,py(e.a0),rPx,hPx,0,PI,2*PI);
+        }
+      }else if(e.s.type==="cylinder"){
+        const rPx=e.r1*scale;
+        ctx.moveTo(cx-rPx,py(e.a0+e.aL));ctx.lineTo(cx-rPx,py(e.a0));
+        ctx.moveTo(cx+rPx,py(e.a0+e.aL));ctx.lineTo(cx+rPx,py(e.a0));
+      }else{
+        const r1p=e.r1*scale,r2p=e.r2*scale;
+        ctx.moveTo(cx-r1p,py(e.a0));ctx.lineTo(cx-r2p,py(e.a0+e.aL));
+        ctx.moveTo(cx+r1p,py(e.a0));ctx.lineTo(cx+r2p,py(e.a0+e.aL));
+      }
+      ctx.stroke();
+    }
+
+    // ── 3. SEGMENT JUNCTION LINES (thin dashed, inside vessel) ─
+    // Draw a horizontal line at each junction between elements
+    ctx.save();ctx.setLineDash([4,3]);ctx.strokeStyle="#5c8db8";ctx.lineWidth=1;
+    for(let i=0;i<els.length-1;i++){
+      const e=els[i],en=els[i+1];
+      const axJ=e.a0+e.aL; // axial position of junction
+      const yJ=py(axJ);
+      // Width at junction = min of right element left radius, left element right radius
+      const rJ=Math.min(
+        e.s.type==="cone"?e.r2:e.r1,
+        en.s.type==="cone"?en.r1:en.r1
+      )*scale;
+      ctx.beginPath();ctx.moveTo(cx-rJ,yJ);ctx.lineTo(cx+rJ,yJ);ctx.stroke();
+    }
+    ctx.restore();
+
+    // ── 4. TANGENT LINE ───────────────────────────────────────
+    const tyPx=py(bhH);
+    ctx.save();ctx.setLineDash([5,4]);ctx.strokeStyle="#999";ctx.lineWidth=1;
+    // Extend only slightly beyond vessel edge, don't cross to opposite side
+    ctx.beginPath();ctx.moveTo(vEdgeL-18,tyPx);ctx.lineTo(vEdgeR+50,tyPx);ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle="#777";ctx.font="10px Segoe UI,Arial";
+    ctx.fillText("TL ±0",vEdgeL-52,tyPx+3);
+
+    // ── 5. FILL LEVEL LINE & LABEL ───────────────────────────
+    if(axFill>0.5&&axFill<total-0.5){
+      const fyPx=py(axFill);
+      const lbl=`${fillLevel>=0?"+":""}${fillLevel.toFixed(0)} mm`;
+      const lblW=ctx.measureText(lbl).width+6;
+      // Short tick lines on each side, stopping at vessel wall
+      ctx.save();ctx.setLineDash([]);ctx.strokeStyle="#1565c0";ctx.lineWidth=1.5;
+      // left tick: from vessel edge outward
+      ctx.beginPath();ctx.moveTo(vEdgeL,fyPx);ctx.lineTo(vEdgeL-14,fyPx);ctx.stroke();
+      // right tick: from vessel edge outward, short
+      ctx.beginPath();ctx.moveTo(vEdgeR,fyPx);ctx.lineTo(vEdgeR+8,fyPx);ctx.stroke();
+      ctx.restore();
+      // label box on the right
+      const lx=vEdgeR+12;
+      ctx.fillStyle="#1565c0";
+      ctx.fillRect(lx-1,fyPx-9,lblW+2,14);
+      ctx.fillStyle="#fff";ctx.font="bold 10px Segoe UI,Arial";
+      ctx.fillText(lbl,lx+2,fyPx+3);
+      // small triangle pointer
+      ctx.fillStyle="#1565c0";
+      ctx.beginPath();ctx.moveTo(lx-5,fyPx);ctx.lineTo(lx-1,fyPx-4);ctx.lineTo(lx-1,fyPx+4);ctx.closePath();ctx.fill();
+    }
+
+  }else{
+    /* ══ HORIZONTAL ════════════════════════════════════════ */
+    // fillLevel here = mm from centreline (+above, −below), range: −maxR … +maxR
+    const drawW=W-2*PAD_X;
+    const drawH2=(H-2*PAD_TOP)/2;
+    const scale=Math.min(drawW/total, drawH2/maxR);
+    const cy=H/2;
+    const vesselPxW=total*scale;
+    const xOrig=PAD_X+(drawW-vesselPxW)/2;
+    const px=a=>xOrig+a*scale;
+    const vEdgeT=cy-maxR*scale; // top of vessel in pixels
+    const vEdgeB=cy+maxR*scale; // bottom of vessel in pixels
+
+    // fillLevel from centreline: +maxR = top, −maxR = bottom
+    // pixel y of fill surface: cy - fillLevel*scale
+    const fillLevelClamped=Math.min(Math.max(fillLevel,-maxR),maxR);
+    const fyPx=cy-fillLevelClamped*scale;
+
+    // ── 1. FILL ───────────────────────────────────────────────
+    for(let i=0;i<els.length;i++){
+      const e=els[i];
+      const xL=px(e.a0),xR=px(e.a0+e.aL);
+      ctx.save();ctx.beginPath();
+      _horizPath(ctx,e,i,scale,cy,px);
+      ctx.clip();
+      ctx.fillStyle="rgba(21,101,192,0.20)";
+      // fill from vessel bottom up to fill line
+      ctx.fillRect(xL,fyPx,xR-xL,vEdgeB-fyPx+2);
+      ctx.restore();
+    }
+
+    // ── 2. VESSEL OUTLINES ────────────────────────────────────
+    ctx.strokeStyle="#1a4f7a";ctx.lineWidth=2;ctx.lineJoin="round";
+    for(let i=0;i<els.length;i++){
+      const e=els[i];
+      const xL=px(e.a0),xR=px(e.a0+e.aL);
+      const rPx=e.r1*scale,hPx=e.aL*scale;
+      ctx.beginPath();
+      if(e.s.type==="head"){
+        if(i===0){
+          if(e.s.headType==="Flat End"){ctx.moveTo(xR,cy-rPx);ctx.lineTo(xR,cy+rPx);}
+          else ctx.ellipse(xR,cy,hPx,rPx,0,PI/2,3*PI/2);
+        }else{
+          if(e.s.headType==="Flat End"){ctx.moveTo(xL,cy-rPx);ctx.lineTo(xL,cy+rPx);}
+          else ctx.ellipse(xL,cy,hPx,rPx,0,-PI/2,PI/2);
+        }
+      }else if(e.s.type==="cylinder"){
+        ctx.moveTo(xL,cy-rPx);ctx.lineTo(xR,cy-rPx);
+        ctx.moveTo(xL,cy+rPx);ctx.lineTo(xR,cy+rPx);
+      }else{
+        const r1p=e.r1*scale,r2p=e.r2*scale;
+        ctx.moveTo(xL,cy-r1p);ctx.lineTo(xR,cy-r2p);
+        ctx.moveTo(xL,cy+r1p);ctx.lineTo(xR,cy+r2p);
+      }
+      ctx.stroke();
+    }
+
+    // ── 3. SEGMENT JUNCTION LINES ─────────────────────────────
+    ctx.save();ctx.setLineDash([4,3]);ctx.strokeStyle="#5c8db8";ctx.lineWidth=1;
+    for(let i=0;i<els.length-1;i++){
+      const e=els[i],en=els[i+1];
+      const xJ=px(e.a0+e.aL);
+      const rJ=Math.min(e.s.type==="cone"?e.r2:e.r1, en.r1)*scale;
+      ctx.beginPath();ctx.moveTo(xJ,cy-rJ);ctx.lineTo(xJ,cy+rJ);ctx.stroke();
+    }
+    ctx.restore();
+
+    // ── 4. CENTRE LINE ────────────────────────────────────────
+    ctx.save();ctx.setLineDash([6,4]);ctx.strokeStyle="#aaa";ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(xOrig-12,cy);ctx.lineTo(xOrig+vesselPxW+50,cy);ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle="#888";ctx.font="10px Segoe UI,Arial";
+    ctx.fillText("CL",xOrig+vesselPxW+54,cy+3);
+
+    // ── 5. FILL LEVEL LINE & LABEL ────────────────────────────
+    if(Math.abs(fillLevelClamped)>0.5){
+      const lbl=`${fillLevelClamped>=0?"+":""}${fillLevelClamped.toFixed(0)} mm`;
+      const lblW=ctx.measureText(lbl).width+6;
+      ctx.save();ctx.setLineDash([]);ctx.strokeStyle="#1565c0";ctx.lineWidth=1.5;
+      // top tick from vessel left edge
+      ctx.beginPath();ctx.moveTo(xOrig,fyPx);ctx.lineTo(xOrig-12,fyPx);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(xOrig+vesselPxW,fyPx);ctx.lineTo(xOrig+vesselPxW+8,fyPx);ctx.stroke();
+      ctx.restore();
+      const lx=xOrig+vesselPxW+12;
+      ctx.fillStyle="#1565c0";
+      ctx.fillRect(lx-1,fyPx-9,lblW+2,14);
+      ctx.fillStyle="#fff";ctx.font="bold 10px Segoe UI,Arial";
+      ctx.fillText(lbl,lx+2,fyPx+3);
+      ctx.fillStyle="#1565c0";
+      ctx.beginPath();ctx.moveTo(lx-5,fyPx);ctx.lineTo(lx-1,fyPx-4);ctx.lineTo(lx-1,fyPx+4);ctx.closePath();ctx.fill();
+    }
+  }
+}
+
+// Build a closed path for one element (used for fill clipping)
+function _vertPath(ctx,e,i,scale,cx,py){
+  if(e.s.type==="head"){
+    const rPx=e.r1*scale,hPx=e.aL*scale;
+    if(i===0){
+      if(e.s.headType==="Flat End"){ctx.rect(cx-rPx,py(0)-1,rPx*2,2);}
+      else{ctx.ellipse(cx,py(e.aL),rPx,hPx,0,0,PI);ctx.closePath();}
+    }else{
+      if(e.s.headType==="Flat End"){ctx.rect(cx-rPx,py(e.a0+e.aL),rPx*2,2);}
+      else{ctx.ellipse(cx,py(e.a0),rPx,hPx,0,PI,2*PI);ctx.closePath();}
+    }
+  }else if(e.s.type==="cylinder"){
+    const rPx=e.r1*scale;
+    ctx.rect(cx-rPx,py(e.a0+e.aL),rPx*2,py(e.a0)-py(e.a0+e.aL));
+  }else{
+    const r1p=e.r1*scale,r2p=e.r2*scale;
+    ctx.moveTo(cx-r1p,py(e.a0));ctx.lineTo(cx-r2p,py(e.a0+e.aL));
+    ctx.lineTo(cx+r2p,py(e.a0+e.aL));ctx.lineTo(cx+r1p,py(e.a0));ctx.closePath();
+  }
+}
+function _horizPath(ctx,e,i,scale,cy,px){
+  const xL=px(e.a0),xR=px(e.a0+e.aL);
+  const rPx=e.r1*scale,hPx=e.aL*scale;
+  if(e.s.type==="head"){
+    if(i===0){
+      if(e.s.headType==="Flat End"){ctx.rect(xR-1,cy-rPx,2,rPx*2);}
+      else{ctx.ellipse(xR,cy,hPx,rPx,0,PI/2,3*PI/2);ctx.closePath();}
+    }else{
+      if(e.s.headType==="Flat End"){ctx.rect(xL-1,cy-rPx,2,rPx*2);}
+      else{ctx.ellipse(xL,cy,hPx,rPx,0,-PI/2,PI/2);ctx.closePath();}
+    }
+  }else if(e.s.type==="cylinder"){
+    ctx.rect(xL,cy-rPx,xR-xL,rPx*2);
+  }else{
+    const r1p=e.r1*scale,r2p=e.r2*scale;
+    ctx.moveTo(xL,cy-r1p);ctx.lineTo(xR,cy-r2p);
+    ctx.lineTo(xR,cy+r2p);ctx.lineTo(xL,cy+r1p);ctx.closePath();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   NUMBER FORMAT – no thousands separator, integer / fixed
+═══════════════════════════════════════════════════════════ */
+const N=(v,d=0)=>isNaN(v)||v==null?"—":v.toFixed(d);
+
+/* ═══════════════════════════════════════════════════════════
+   STYLES
+═══════════════════════════════════════════════════════════ */
+const C={
+  hdr:"#1e3a5f",hdrTxt:"#ffffff",hdrSub:"#90caf9",
+  panel:"#ffffff",sideBg:"#eceff1",sideDark:"#dde3ea",
+  accent:"#1565c0",accentDark:"#0d47a1",accentLight:"#e3f2fd",
+  border:"#cfd8dc",borderDark:"#90a4ae",
+  txt:"#1a2332",txtMid:"#546e7a",txtLight:"#90a4ae",
+  success:"#1b5e20",warn:"#e65100",rowAlt:"#f5f9ff",
+};
+const F="Segoe UI,Tahoma,Arial,sans-serif";
+const inp={fontFamily:F,fontSize:13,color:C.txt,background:"#fff",border:`1px solid ${C.border}`,borderRadius:3,padding:"4px 7px",outline:"none"};
+const sel={...inp,cursor:"pointer"};
+const btn=(bg,fg,bdr)=>({fontFamily:F,fontSize:12,fontWeight:600,background:bg,color:fg,border:`1px solid ${bdr||bg}`,borderRadius:3,padding:"5px 12px",cursor:"pointer",whiteSpace:"nowrap"});
+const secHd={fontSize:11,fontWeight:700,color:C.hdr,textTransform:"uppercase",letterSpacing:"0.06em",paddingBottom:5,marginBottom:8,borderBottom:`1px solid ${C.border}`};
+const lbl={fontSize:11,fontWeight:600,color:C.txtMid,textTransform:"uppercase",letterSpacing:"0.04em",display:"block",marginBottom:3};
+
+/* ═══════════════════════════════════════════════════════════
+   SEGMENT ROW
+═══════════════════════════════════════════════════════════ */
+function SegRow({seg,idx,total,onUpd,onDel,onUp,onDn}){
+  const[open,setOpen]=useState(true);
+  const u=(f,v)=>onUpd(idx,{...seg,[f]:v});
+  const nm=seg.type==="head"
+    ?`Head – ${seg.headType} (Ø${seg.id??'?'} mm)`
+    :seg.type==="cylinder"
+    ?`Cylinder – Ø${seg.id??'?'} × ${seg.length??'?'} mm`
+    :`Cone/Reducer – Ø${seg.id1??'?'} → Ø${seg.id2??'?'} × ${seg.length??'?'} mm`;
+
+  return(
+    <div style={{border:`1px solid ${C.border}`,borderRadius:3,marginBottom:5,overflow:"hidden",background:"#fff"}}>
+      <div onClick={()=>setOpen(o=>!o)} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 9px",background:open?"#dbeafe":"#f1f5f9",cursor:"pointer",userSelect:"none",borderBottom:open?`1px solid ${C.border}`:"none"}}>
+        <span style={{fontFamily:"monospace",fontSize:11,color:C.accent,fontWeight:700,minWidth:18}}>{idx+1}</span>
+        <span style={{flex:1,fontSize:12,color:C.txt,fontWeight:open?600:400,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{nm}</span>
+        <button onClick={e=>{e.stopPropagation();onUp(idx);}} disabled={idx===0} style={{...btn("#fff",C.txtMid,C.border),padding:"1px 6px",fontWeight:400}}>▲</button>
+        <button onClick={e=>{e.stopPropagation();onDn(idx);}} disabled={idx===total-1} style={{...btn("#fff",C.txtMid,C.border),padding:"1px 6px",fontWeight:400}}>▼</button>
+        <button onClick={e=>{e.stopPropagation();onDel(idx);}} style={{...btn("#fff","#c62828","#ef9a9a"),padding:"1px 6px",fontWeight:700}}>✕</button>
+      </div>
+      {open&&(
+        <div style={{padding:"8px 10px",background:"#fafbfc",display:"flex",flexWrap:"wrap",gap:12,alignItems:"flex-end"}}>
+          {seg.type==="head"&&<>
+            <div>
+              <span style={lbl}>Head Type</span>
+              <select value={seg.headType} onChange={e=>u("headType",e.target.value)} style={{...sel,width:160}}>
+                {HEAD_TYPES.map(t=><option key={t}>{t}</option>)}
+              </select>
+              <div style={{fontSize:10,color:C.txtLight,marginTop:2,fontStyle:"italic"}}>{headNote(seg.headType,(seg.id||0)/2)}</div>
+            </div>
+            <div><span style={lbl}>Inner Diameter (mm)</span>
+              <input type="number" value={seg.id??""} min={1} onChange={e=>u("id",parseFloat(e.target.value))} style={{...inp,width:110}}/></div>
+          </>}
+          {seg.type==="cylinder"&&<>
+            <div><span style={lbl}>Inner Diameter (mm)</span>
+              <input type="number" value={seg.id??""} min={1} onChange={e=>u("id",parseFloat(e.target.value))} style={{...inp,width:110}}/></div>
+            <div><span style={lbl}>Length (mm)</span>
+              <input type="number" value={seg.length??""} min={1} onChange={e=>u("length",parseFloat(e.target.value))} style={{...inp,width:110}}/></div>
+          </>}
+          {seg.type==="cone"&&<>
+            <div><span style={lbl}>Ø Bottom / Left (mm)</span>
+              <input type="number" value={seg.id1??""} min={1} onChange={e=>u("id1",parseFloat(e.target.value))} style={{...inp,width:110}}/></div>
+            <div><span style={lbl}>Ø Top / Right (mm)</span>
+              <input type="number" value={seg.id2??""} min={1} onChange={e=>u("id2",parseFloat(e.target.value))} style={{...inp,width:110}}/></div>
+            <div><span style={lbl}>Length (mm)</span>
+              <input type="number" value={seg.length??""} min={1} onChange={e=>u("length",parseFloat(e.target.value))} style={{...inp,width:110}}/></div>
+          </>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   KV ROW (result display)
+═══════════════════════════════════════════════════════════ */
+function KV({label,val,unit,bold}){
+  return(
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",padding:"4px 0",borderBottom:`1px solid #edf2f7`}}>
+      <span style={{fontSize:12,color:C.txtMid}}>{label}</span>
+      <span style={{fontSize:bold?14:13,fontWeight:bold?700:500,color:bold?C.hdr:C.txt,fontFamily:"monospace"}}>
+        {val}{unit&&<span style={{fontSize:11,color:C.txtMid,fontFamily:F,marginLeft:2,fontWeight:400}}> {unit}</span>}
+      </span>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SAVE / LOAD  using File System Access API (with fallback)
+═══════════════════════════════════════════════════════════ */
+async function saveData(data){
+  const json=JSON.stringify(data,null,2);
+  const blob=new Blob([json],{type:"application/json"});
+  // Try File System Access API (allows folder selection)
+  if(window.showSaveFilePicker){
+    try{
+      const fh=await window.showSaveFilePicker({
+        suggestedName:"vessel-data.json",
+        types:[{description:"JSON Data",accept:{"application/json":[".json"]}}],
+      });
+      const w=await fh.createWritable();
+      await w.write(blob);
+      await w.close();
+      return true;
+    }catch(e){
+      if(e.name==="AbortError")return false;
+    }
+  }
+  // Fallback: plain download
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");a.href=url;a.download="vessel-data.json";a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  return true;
+}
+
+async function loadData(onLoad){
+  if(window.showOpenFilePicker){
+    try{
+      const[fh]=await window.showOpenFilePicker({types:[{description:"JSON Data",accept:{"application/json":[".json"]}}]});
+      const file=await fh.getFile();
+      const text=await file.text();
+      onLoad(JSON.parse(text));
+      return;
+    }catch(e){if(e.name==="AbortError")return;}
+  }
+  // Fallback
+  const input=document.createElement("input");input.type="file";input.accept=".json";
+  input.onchange=async e=>{
+    const file=e.target.files[0];if(!file)return;
+    const text=await file.text();onLoad(JSON.parse(text));
+  };
+  input.click();
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MAIN APP
+═══════════════════════════════════════════════════════════ */
+function App(){
+  const[ori,setOri]=useState("vertical");
+  const[segs,setSegs]=useState([
+    {type:"head",headType:"2:1 Ellipsoidal",id:1000},
+  ]);
+  const[fill,setFill]=useState(0);
+  const[spW,setSpW]=useState(1000);
+  const[saveMsg,setSaveMsg]=useState("");
+  const canvRef=useRef(null);
+
+  // Only include valid/complete segments
+  const valid=segs.filter(s=>{
+    if(s.type==="head")     return (s.id||0)>0;
+    if(s.type==="cylinder") return (s.id||0)>0&&(s.length||0)>0;
+    if(s.type==="cone")     return (s.id1||0)>0&&(s.id2||0)>0&&(s.length||0)>0;
+    return false;
+  });
+  const{els,total}=buildGeo(valid);
+  const maxR=els.length?Math.max(...els.map(e=>Math.max(e.r1,e.r2))):500;
+  const bhH=els.length&&els[0].s.type==="head"?els[0].aL:0;
+  const fillMin=ori==="vertical"?Math.round(-bhH):Math.round(-maxR);
+  const fillMax=ori==="vertical"?Math.round(total-bhH):Math.round(maxR);
+  const clamp=v=>Math.min(fillMax,Math.max(fillMin,isNaN(v)?0:v));
+
+  const fullV=els.reduce((s,e)=>s+e.fv,0);
+  const partV=calcFill(ori,els,fill);
+  const toL=v=>v/1e6,toM3=v=>v/1e9;
+  const fillPct=fullV>0?partV/fullV*100:0;
+
+  useEffect(()=>{drawVessel(canvRef.current,ori,els,total,fill);},[ori,segs,fill]);
+
+  const addSeg=t=>{
+    const last=segs[segs.length-1];
+    const lid=last?(last.id||last.id2||1000):1000;
+    if(t==="head")     setSegs(s=>[...s,{type:"head",headType:"2:1 Ellipsoidal",id:lid}]);
+    if(t==="cylinder") setSegs(s=>[...s,{type:"cylinder",id:lid,length:1000}]);
+    if(t==="cone")     setSegs(s=>[...s,{type:"cone",id1:lid,id2:Math.round(lid*0.6),length:500}]);
+  };
+  const updSeg=(i,v)=>setSegs(s=>s.map((x,j)=>j===i?v:x));
+  const delSeg=i=>setSegs(s=>s.filter((_,j)=>j!==i));
+  const movSeg=(i,d)=>{const a=[...segs],t=a[i];a[i]=a[i+d];a[i+d]=t;setSegs(a);};
+
+  const doSave=async()=>{
+    const ok=await saveData({orientation:ori,segments:segs,fillLevel:fill,specificWeight:spW});
+    if(ok){setSaveMsg("✓ Saved");setTimeout(()=>setSaveMsg(""),3000);}
+  };
+  const doLoad=()=>{
+    loadData(d=>{
+      if(d.segments)setSegs(d.segments);
+      if(d.orientation)setOri(d.orientation);
+      if(d.fillLevel!=null)setFill(d.fillLevel);
+      if(d.specificWeight)setSpW(d.specificWeight);
+      setSaveMsg("✓ Loaded");setTimeout(()=>setSaveMsg(""),3000);
+    });
+  };
+
+  const lvlLabel=ori==="vertical"
+    ?`Fill level from tangent line (mm)  [ ${N(fillMin)} … +${N(fillMax)} ]`
+    :`Fill level from centre line (mm)  [ ${N(fillMin)} … +${N(fillMax)} ]`;
+
+  return(
+    <div style={{height:"100%",display:"flex",flexDirection:"column",background:C.sideBg}}>
+
+      {/* ── TITLE BAR ── */}
+      <div style={{background:C.hdr,color:C.hdrTxt,padding:"7px 16px",display:"flex",alignItems:"center",gap:10,boxShadow:"0 2px 6px rgba(0,0,0,0.3)",flexShrink:0,zIndex:10}}>
+        <span style={{fontSize:22,lineHeight:1}}>⚙</span>
+        <div style={{flex:1}}>
+          <div style={{fontSize:15,fontWeight:700}}>Pressure Vessel Volume Calculator</div>
+          <div style={{fontSize:10,color:C.hdrSub,letterSpacing:"0.05em"}}>Multi-section · Vertical &amp; Horizontal · Partial Fill · ASME / DIN Heads</div>
+        </div>
+        {/* Save / Load */}
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          {saveMsg&&<span style={{fontSize:11,color:"#a5d6a7",fontWeight:600}}>{saveMsg}</span>}
+          <button onClick={doSave} style={{...btn("#1976d2","#fff","#1565c0"),fontSize:11}}>💾 Save…</button>
+          <button onClick={doLoad} style={{...btn("#fff",C.accent,C.accent),fontSize:11}}>📂 Open…</button>
+        </div>
+      </div>
+
+      {/* ── MAIN AREA ── */}
+      <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+
+        {/* ── LEFT PANEL ── */}
+        <div style={{width:355,minWidth:320,background:C.sideBg,borderRight:`1px solid ${C.borderDark}`,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+
+          {/* Orientation */}
+          <div style={{padding:"10px 12px",background:C.sideDark,borderBottom:`1px solid ${C.borderDark}`,flexShrink:0}}>
+            <div style={secHd}>Vessel Orientation</div>
+            <div style={{display:"flex",gap:6}}>
+              {["vertical","horizontal"].map(o=>(
+                <button key={o} onClick={()=>{setOri(o);setFill(0);}} style={{
+                  flex:1,padding:"6px",borderRadius:3,cursor:"pointer",fontFamily:F,fontSize:13,fontWeight:600,
+                  background:ori===o?C.accent:"#fff",color:ori===o?"#fff":C.accent,
+                  border:`1px solid ${ori===o?C.accentDark:C.accent}`,
+                  boxShadow:ori===o?"inset 0 1px 3px rgba(0,0,0,0.2)":"none"
+                }}>{o==="vertical"?"⬆  Vertical":"➡  Horizontal"}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Sections */}
+          <div style={{flex:1,overflowY:"auto",padding:"10px 12px"}}>
+            <div style={secHd}>
+              Vessel Sections &nbsp;—&nbsp;{ori==="vertical"?"Bottom → Top":"Left → Right"}
+            </div>
+            {segs.map((seg,i)=>(
+              <SegRow key={i} seg={seg} idx={i} total={segs.length}
+                onUpd={updSeg} onDel={delSeg} onUp={j=>movSeg(j,-1)} onDn={j=>movSeg(j,1)}/>
+            ))}
+            <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+              <button onClick={()=>addSeg("head")}     style={btn(C.accent,"#fff")}>+ Head</button>
+              <button onClick={()=>addSeg("cylinder")} style={btn(C.accent,"#fff")}>+ Cylinder</button>
+              <button onClick={()=>addSeg("cone")}     style={btn("#fff",C.accent,C.accent)}>+ Cone / Reducer</button>
+            </div>
+          </div>
+
+          {/* Operating params */}
+          <div style={{padding:"10px 12px",background:C.sideDark,borderTop:`1px solid ${C.borderDark}`,flexShrink:0}}>
+            <div style={secHd}>Operating Parameters</div>
+            <div style={{marginBottom:10}}>
+              <label style={lbl}>{lvlLabel}</label>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <input type="range" min={fillMin} max={fillMax} step={1} value={fill}
+                  onChange={e=>setFill(parseFloat(e.target.value))} style={{flex:1}}/>
+                <input type="number" value={fill} min={fillMin} max={fillMax}
+                  onChange={e=>setFill(clamp(parseFloat(e.target.value)))}
+                  style={{...inp,width:75,textAlign:"right"}}/>
+              </div>
+            </div>
+            <div>
+              <label style={lbl}>Specific Weight of Content (kg/m³)</label>
+              <input type="number" value={spW} min={1}
+                onChange={e=>setSpW(parseFloat(e.target.value)||1000)}
+                style={{...inp,width:120}}/>
+            </div>
+          </div>
+        </div>
+
+        {/* ── RIGHT PANEL ── */}
+        <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column"}}>
+
+          {/* Canvas area */}
+          <div style={{padding:"12px 16px",background:"#e8edf3",borderBottom:`1px solid ${C.borderDark}`,display:"flex",justifyContent:"center",flexShrink:0}}>
+            <div style={{background:"#fff",border:`1px solid ${C.borderDark}`,borderRadius:4,boxShadow:"0 1px 5px rgba(0,0,0,0.12)",padding:8,display:"inline-block"}}>
+              <canvas ref={canvRef} width={560} height={320} style={{display:"block"}}/>
+            </div>
+          </div>
+
+          {/* Results */}
+          <div style={{padding:"12px 16px",flex:1}}>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+
+              {/* Full vessel */}
+              <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:4,padding:14,boxShadow:"0 1px 3px rgba(0,0,0,0.07)"}}>
+                <div style={{...secHd,color:C.success}}>Full Vessel</div>
+                <KV label="Total Volume" val={N(toM3(fullV),4)} unit="m³" bold/>
+                <KV label="Content Weight" val={N(toM3(fullV)*spW,0)} unit="kg"/>
+                <KV label="Total Length" val={N(total,0)} unit="mm"/>
+              </div>
+
+              {/* At operating level */}
+              <div style={{background:C.panel,border:`1px solid ${C.border}`,borderLeft:`3px solid ${C.accent}`,borderRadius:4,padding:14,boxShadow:"0 1px 3px rgba(0,0,0,0.07)"}}>
+                <div style={{...secHd,color:C.accent}}>At Operating Level ({N(fillPct,1)} %)</div>
+                <KV label="Volume" val={N(toM3(partV),4)} unit="m³" bold/>
+                <KV label="Content Weight" val={N(toM3(partV)*spW,0)} unit="kg"/>
+                <KV label="Fill Level" val={ori==="vertical"
+                  ?`${fill>=0?"+":""}${N(fill,0)} mm from TL`
+                  :`${fill>=0?"+":""}${N(fill,0)} mm from CL`}/>
+              </div>
+            </div>
+
+            {/* Section table */}
+            {els.length>0&&(
+              <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:4,overflow:"hidden",boxShadow:"0 1px 3px rgba(0,0,0,0.07)",marginBottom:10}}>
+                <div style={{padding:"7px 12px",background:C.hdr}}>
+                  <span style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",color:"#fff"}}>Section Breakdown</span>
+                </div>
+                <div style={{overflowX:"auto"}}>
+                  <table style={{width:"100%",fontSize:12,fontFamily:F}}>
+                    <thead>
+                      <tr style={{background:"#e3f2fd",color:C.hdr}}>
+                        {["#","Type","Head Type / Details","Ø Bottom (mm)","Ø Top (mm)","Axial Start (mm)","Head h / Shell L (mm)","Volume (m³)","% total"].map(h=>(
+                          <th key={h} style={{textAlign:"left",padding:"5px 8px",fontSize:11,fontWeight:700,borderBottom:`1px solid ${C.border}`,whiteSpace:"nowrap"}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {els.map((el,i)=>{
+                        const dBot=el.s.type==="head"?el.s.id:(el.s.type==="cone"?el.s.id1:el.s.id);
+                        const dTop=el.s.type==="head"?el.s.id:(el.s.type==="cone"?el.s.id2:el.s.id);
+                        const hNote=el.s.type==="head"
+                          ?`h = ${N(el.aL,1)}`
+                          :el.s.type==="cylinder"
+                          ?`L = ${N(el.aL,0)}`
+                          :`L = ${N(el.aL,0)}`;
+                        const detail=el.s.type==="head"?el.s.headType
+                          :el.s.type==="cylinder"?"Cylinder"
+                          :"Cone/Reducer";
+                        return(
+                          <tr key={i} style={{background:i%2===0?"#fff":C.rowAlt,borderBottom:`1px solid #edf2f7`}}>
+                            <td style={{padding:"4px 8px",color:C.accent,fontWeight:700}}>{i+1}</td>
+                            <td style={{padding:"4px 8px",fontWeight:600}}>
+                              {el.s.type==="head"?"Head":el.s.type==="cylinder"?"Cylinder":"Cone/Red."}
+                            </td>
+                            <td style={{padding:"4px 8px",color:C.txtMid,fontSize:11}}>{detail}</td>
+                            <td style={{padding:"4px 8px",fontFamily:"monospace"}}>{N(dBot,0)}</td>
+                            <td style={{padding:"4px 8px",fontFamily:"monospace"}}>{N(dTop,0)}</td>
+                            <td style={{padding:"4px 8px",fontFamily:"monospace"}}>{N(el.a0,0)}</td>
+                            <td style={{padding:"4px 8px",fontFamily:"monospace",color:C.accent}}>{hNote}</td>
+                            <td style={{padding:"4px 8px",fontFamily:"monospace",fontWeight:600}}>{N(toM3(el.fv),4)}</td>
+                            <td style={{padding:"4px 8px"}}>{fullV>0?N(el.fv/fullV*100,1)+" %":"—"}</td>
+                          </tr>
+                        );
+                      })}
+                      {/* Totals row */}
+                      <tr style={{background:"#e8f4f8",borderTop:`2px solid ${C.border}`,fontWeight:700}}>
+                        <td colSpan={7} style={{padding:"5px 8px",color:C.hdr,fontSize:12}}>TOTAL</td>
+                        <td style={{padding:"5px 8px",fontFamily:"monospace",color:C.hdr}}>{N(toM3(fullV),4)}</td>
+                        <td style={{padding:"5px 8px",color:C.hdr}}>100 %</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Head reference */}
+            <details style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:4,padding:"6px 12px",fontSize:11,color:C.txtMid,cursor:"pointer"}}>
+              <summary style={{fontWeight:700,color:C.hdr,fontSize:11,textTransform:"uppercase",letterSpacing:"0.05em"}}>Head Types Reference ▾</summary>
+              <div style={{marginTop:8,lineHeight:1.7}}>
+                <b>2:1 Ellipsoidal</b> — h = D/4 = r/2 per ASME UG-32<br/>
+                <b>Hemispherical</b> — h = r<br/>
+                <b>Korbbogen</b> — Crown R = 0.8D, Knuckle r = 0.154D per DIN 28013<br/>
+                <b>Flat End</b> — h = 0, V = 0 (flat plate closure)<br/>
+                <hr style={{margin:"6px 0",borderColor:C.border}}/>
+                Vertical fill measured from tangent line (TL) = bottom head/shell junction.<br/>
+                Horizontal fill measured from vessel centre line (CL): + = above CL, − = below CL.<br/>
+                All dimensions in mm. Volumes in m³.
+              </div>
+            </details>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
